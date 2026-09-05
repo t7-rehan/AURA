@@ -1,0 +1,10 @@
+{
+  "name": "AURA — Hand-Controlled Particle Visualization",
+  "description": "Interactive AI-powered particle visualization controlled by hand movements.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
