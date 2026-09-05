@@ -39,10 +39,16 @@ export class ParticleSystem {
 
     for (let i = 0; i < count; i++) {
       const i3 = i * 3;
-      // Gentle initial thermal drift
-      this.velocities[i3] = (Math.random() - 0.5) * 1.2;
-      this.velocities[i3 + 1] = (Math.random() - 0.5) * 1.2;
-      this.velocities[i3 + 2] = (Math.random() - 0.5) * 1.2;
+      const px = this.positions[i3];
+      const py = this.positions[i3 + 1];
+      const r = Math.hypot(px, py);
+      const invR = r > 0.001 ? 1.0 / r : 0.0;
+      const tanSpeed = 8.5 * Math.tanh(r / 26.0);
+
+      // Initial orbital tangential velocity + gentle thermal dispersion
+      this.velocities[i3] = -py * invR * tanSpeed + (Math.random() - 0.5) * 0.6;
+      this.velocities[i3 + 1] = px * invR * tanSpeed + (Math.random() - 0.5) * 0.6;
+      this.velocities[i3 + 2] = (Math.random() - 0.5) * 0.4;
 
       // Base colors (Cyan to Violet spectrum)
       const t = Math.random();

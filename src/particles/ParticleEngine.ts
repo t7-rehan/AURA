@@ -82,8 +82,8 @@ export class ParticleEngine {
   }
 
   public getSmoothedHands(): {
-    handA: { x: number; y: number; z: number } | null;
-    handB: { x: number; y: number; z: number } | null;
+    handA: { x: number; y: number; z: number; gesture?: string } | null;
+    handB: { x: number; y: number; z: number; gesture?: string } | null;
   } {
     return this.physics.getSmoothedHands();
   }

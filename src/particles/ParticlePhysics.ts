@@ -29,10 +29,6 @@ interface DriftingVortex {
   axisX: number;
   axisY: number;
   axisZ: number;
-  radialFreq: number;
-  radialAmp: number;
-  rosetteLobes: number;
-  rosetteAmp: number;
 }
 
 export class ParticlePhysics {
@@ -57,17 +53,19 @@ export class ParticlePhysics {
 
   private partitionWeight = 0.0; // 0.0 = Single Universe, 1.0 = Dual Groups Split
   private isDualHandActive = false;
-  private dualHandConfirmFrames = 0;
-  private singleHandConfirmFrames = 0;
+  private singleHandLossFrames = 0;
 
-  // Hand Anchors in World Space with Ultra-Fast Exponential Response (1-2 frame latency)
+  // Hand Anchors in World Space with Snappy Exponential Response (<20ms latency)
   private smoothedAnchorA = { x: -25, y: 0, z: 0 };
   private smoothedAnchorB = { x: 25, y: 0, z: 0 };
   private smoothedUnifiedAnchor = { x: 0, y: 0, z: 0 };
 
-  // Previous Hand Positions for Outlier Rejection & Smooth Velocity Tracking
-  private rawPrevHandA = { x: -25, y: 0, z: 0 };
-  private rawPrevHandB = { x: 25, y: 0, z: 0 };
+  // Hand Positions for Physical Delta Velocity Tracking
+  private prevHandPosA = { x: -25, y: 0, z: 0 };
+  private prevHandPosB = { x: 25, y: 0, z: 0 };
+  private hasPrevHandA = false;
+  private hasPrevHandB = false;
+
   private smoothedVelA = { x: 0, y: 0, z: 0 };
   private smoothedVelB = { x: 0, y: 0, z: 0 };
 
@@ -169,8 +167,10 @@ export class ParticlePhysics {
   }
 
   /**
-   * Transforms normalized MediaPipe 3D coordinates [0..1] directly into
-   * the visible Three.js viewport dimensions, taking into account aspect ratio and camera projection.
+   * Camera NDC Ray Unprojection:
+   * Maps normalized MediaPipe coordinates [0..1] directly through the Three.js
+   * perspective camera frustum (fov=60°, pos=(0,0,115)) onto world space at depth z.
+   * Hand tip and palm in world space align directly with the screen ray under the hand.
    */
   public mapHandToWorld(
     normX: number,
@@ -181,20 +181,32 @@ export class ParticlePhysics {
     const screenNormX = isMirrored ? (1.0 - normX) : normX;
     const screenNormY = normY;
 
-    const x = (screenNormX - 0.5) * (this.bounds.halfWidth * 2.0);
-    const y = (0.5 - screenNormY) * (this.bounds.halfHeight * 2.0);
-    const z = -normZ * 20.0;
+    // Normalized Device Coordinates in [-1, 1]
+    const ndcX = (screenNormX - 0.5) * 2.0;
+    const ndcY = (0.5 - screenNormY) * 2.0;
+
+    // Hand depth mapped relative to world z=0 plane
+    const z = Math.max(-25.0, Math.min(25.0, -normZ * 25.0));
+
+    // Perspective camera at (0, 0, 115) with vertical FOV 60°:
+    // tan(30°) = 0.5773502691896257
+    const dist = 115.0 - z;
+    const halfH = 0.5773502691896257 * dist;
+    const aspect = this.bounds.halfWidth / Math.max(1.0, this.bounds.halfHeight);
+    const halfW = halfH * aspect;
+
+    const x = ndcX * halfW;
+    const y = ndcY * halfH;
 
     return { x, y, z };
   }
 
   /**
    * Reusable multi-scale divergence-free 3D curl flow field:
-   * 70% Large-Scale slow broad movement (k1 = 0.014)
-   * 20% Medium-Scale vortex & orbital currents (k2 = 0.030)
-   * 10% Small-Scale subtle spatially-coherent turbulence (k3 = 0.060)
-   * Guaranteed divergence-free: small position change -> small velocity change;
-   * neighboring particles always share coherent fluid velocities.
+   * 80% Large-Scale slow broad movement (k1 = 0.012)
+   * 20% Medium-Scale braided current (k2 = 0.024)
+   * Zero high-frequency noise: small position change -> small velocity change;
+   * neighboring particles always share coherent laminar fluid velocities.
    */
   public getCurlFlow(
     px: number,
@@ -202,30 +214,23 @@ export class ParticlePhysics {
     pz: number,
     t: number
   ): { x: number; y: number; z: number } {
-    // Large Scale (70%): slow sweeping streamlines
-    const k1 = 0.014;
-    const w1 = t * 0.22;
+    // Large Scale (80%): sweeping streamlines
+    const k1 = 0.012;
+    const w1 = t * 0.16;
     const lvx = -Math.sin(k1 * py - w1 * 0.7) - Math.cos(k1 * pz + w1 * 0.9);
     const lvy = -Math.sin(k1 * pz - w1 * 0.8) - Math.cos(k1 * px + w1 * 1.1);
     const lvz = -Math.sin(k1 * px - w1) - Math.cos(k1 * py + w1 * 0.75);
 
-    // Medium Scale (20%): secondary loops
-    const k2 = 0.030;
-    const w2 = t * 0.38;
+    // Medium Scale (20%): braided secondary currents
+    const k2 = 0.024;
+    const w2 = t * 0.28;
     const mvx = -Math.sin(k2 * py - w2 * 0.7) - Math.cos(k2 * pz + w2 * 0.9);
     const mvy = -Math.sin(k2 * pz - w2 * 0.8) - Math.cos(k2 * px + w2 * 1.1);
     const mvz = -Math.sin(k2 * px - w2) - Math.cos(k2 * py + w2 * 0.75);
 
-    // Small Scale (10%): fine divergence-free fluid swirls (never noisy)
-    const k3 = 0.060;
-    const w3 = t * 0.55;
-    const svx = -Math.sin(k3 * py - w3 * 0.7) - Math.cos(k3 * pz + w3 * 0.9);
-    const svy = -Math.sin(k3 * pz - w3 * 0.8) - Math.cos(k3 * px + w3 * 1.1);
-    const svz = -Math.sin(k3 * px - w3) - Math.cos(k3 * py + w3 * 0.75);
-
-    const fx = lvx * 0.70 + mvx * 0.20 + svx * 0.10;
-    const fy = lvy * 0.70 + mvy * 0.20 + svy * 0.10;
-    const fz = lvz * 0.70 + mvz * 0.20 + svz * 0.10;
+    const fx = lvx * 0.80 + mvx * 0.20;
+    const fy = lvy * 0.80 + mvy * 0.20;
+    const fz = lvz * 0.80 + mvz * 0.20;
 
     const len = Math.sqrt(fx * fx + fy * fy + fz * fz + 0.0001);
     return { x: fx / len, y: fy / len, z: fz / len };
@@ -233,7 +238,7 @@ export class ParticlePhysics {
 
   /**
    * Main fluid particle simulation step running directly on flat GPU typed arrays.
-   * acceleration = baseFlow + vortexFlow + orbitalFlow + cohesion + handForce + handWake + boundaryForce
+   * acceleration = baseFlow + vortexFlow + cohesion + handForce + handWake + boundaryForce
    * velocity += acceleration * deltaTime
    * velocity *= exp(-damping * deltaTime)
    * position += velocity * deltaTime
@@ -253,120 +258,131 @@ export class ParticlePhysics {
     const safeDt = Math.max(0.001, Math.min(dt, 0.033));
     this.time += safeDt * this.config.flowSpeed;
 
-    // 2. Extract & process world hands with outlier protection
-    const worldHands: WorldHand[] = [];
+    // 2. Extract & process world hands with persistent identity & low latency
+    let handA: WorldHand | null = null;
+    let handB: WorldHand | null = null;
+
     if (handState && handState.hands.length > 0) {
+      const currentHands: WorldHand[] = [];
       for (const hand of handState.hands) {
         const tip = this.mapHandToWorld(hand.indexTip.x, hand.indexTip.y, hand.indexTip.z, isMirrored);
         const palm = this.mapHandToWorld(hand.palmCenter.x, hand.palmCenter.y, hand.palmCenter.z, isMirrored);
 
-        const scaleX = this.bounds.halfWidth * 2.0;
-        const scaleY = this.bounds.halfHeight * 2.0;
-        const rawVx = (isMirrored ? -hand.velocity.x : hand.velocity.x) * scaleX;
-        const rawVy = -hand.velocity.y * scaleY;
-        const rawVz = -hand.velocity.z * 30.0;
-
-        const handSpeed = Math.hypot(rawVx, rawVy, rawVz);
-        const maxHandSpd = this.config.maxHandSpeed;
-        const clampedVx = handSpeed > maxHandSpd ? (rawVx / handSpeed) * maxHandSpd : rawVx;
-        const clampedVy = handSpeed > maxHandSpd ? (rawVy / handSpeed) * maxHandSpd : rawVy;
-        const clampedVz = handSpeed > maxHandSpd ? (rawVz / handSpeed) * maxHandSpd : rawVz;
-
-        worldHands.push({
+        currentHands.push({
           id: hand.id,
           handedness: hand.handedness,
           tip,
           palm,
-          velocity: { x: clampedVx, y: clampedVy, z: clampedVz },
+          velocity: { x: 0, y: 0, z: 0 },
           isOpenPalm: hand.isOpenPalm,
           isPinching: hand.isPinching,
           handScale: hand.handScale,
         });
       }
+
+      if (currentHands.length === 1) {
+        handA = currentHands[0];
+      } else if (currentHands.length >= 2) {
+        // Persistent identity: MediaPipe handedness determines Group A (Left) / Group B (Right).
+        const leftCandidate = currentHands.find((h) => h.handedness === 'Left');
+        const rightCandidate = currentHands.find((h) => h.handedness === 'Right');
+
+        if (leftCandidate && rightCandidate && leftCandidate !== rightCandidate) {
+          handA = leftCandidate;
+          handB = rightCandidate;
+        } else {
+          // Handedness ambiguous or duplicate: use spatial hysteresis against last known anchors
+          const d0A = Math.hypot(
+            currentHands[0].palm.x - this.smoothedAnchorA.x,
+            currentHands[0].palm.y - this.smoothedAnchorA.y
+          );
+          const d1A = Math.hypot(
+            currentHands[1].palm.x - this.smoothedAnchorA.x,
+            currentHands[1].palm.y - this.smoothedAnchorA.y
+          );
+          if (d0A <= d1A) {
+            handA = currentHands[0];
+            handB = currentHands[1];
+          } else {
+            handA = currentHands[1];
+            handB = currentHands[0];
+          }
+        }
+      }
     }
 
-    // 3. Dual-Hand Stability & Debouncing
-    if (worldHands.length >= 2) {
-      this.dualHandConfirmFrames++;
-      this.singleHandConfirmFrames = 0;
-      if (this.dualHandConfirmFrames >= 3) {
-        this.isDualHandActive = true;
-      }
+    // 3. Dual-Hand Activation without delay (zero debounce delay)
+    const hasTwoHands = handA !== null && handB !== null;
+    if (hasTwoHands) {
+      this.isDualHandActive = true;
+      this.singleHandLossFrames = 0;
     } else {
-      this.singleHandConfirmFrames++;
-      this.dualHandConfirmFrames = 0;
-      if (this.singleHandConfirmFrames >= 4) {
+      this.singleHandLossFrames++;
+      if (this.singleHandLossFrames >= 2) {
         this.isDualHandActive = false;
       }
     }
 
     // Smooth Partition Weight Transition (Single Universe <-> Dual Groups)
     const partitionTarget = this.isDualHandActive ? 1.0 : 0.0;
-    const partitionSpeed = this.isDualHandActive ? 2.8 : 2.0;
+    const partitionSpeed = safeDt * 4.5;
     if (this.partitionWeight < partitionTarget) {
-      this.partitionWeight = Math.min(partitionTarget, this.partitionWeight + safeDt * partitionSpeed);
+      this.partitionWeight = Math.min(partitionTarget, this.partitionWeight + partitionSpeed);
     } else if (this.partitionWeight > partitionTarget) {
-      this.partitionWeight = Math.max(partitionTarget, this.partitionWeight - safeDt * partitionSpeed);
+      this.partitionWeight = Math.max(partitionTarget, this.partitionWeight - partitionSpeed);
     }
 
-    // 4. Stable Spatial Assignment for Hand A (Left) and Hand B (Right)
-    let handA: WorldHand | null = null;
-    let handB: WorldHand | null = null;
-
-    if (worldHands.length === 1) {
-      handA = worldHands[0];
-    } else if (worldHands.length >= 2) {
-      const h0 = worldHands[0];
-      const h1 = worldHands[1];
-      if (h0.palm.x <= h1.palm.x) {
-        handA = h0;
-        handB = h1;
-      } else {
-        handA = h1;
-        handB = h0;
-      }
-    }
-
-    // Outlier Rejection & Snappy Hand Smoothing (Responsive within 1-2 frames)
-    const maxHandJump = 160.0;
-    const smoothFactor = 1.0 - Math.exp(-safeDt * 48.0);
-    const velSmoothFactor = 1.0 - Math.exp(-safeDt * 42.0);
-    const gestureSpeed = 1.0 - Math.exp(-safeDt * 38.0);
+    // Snappy Hand Smoothing & Delta Velocity Tracking (< 20ms response)
+    const maxHandJump = 180.0;
+    const smoothFactor = 1.0 - Math.exp(-safeDt * 55.0);
+    const velSmoothFactor = 1.0 - Math.exp(-safeDt * 45.0);
+    const gestureSpeed = 1.0 - Math.exp(-safeDt * 40.0);
 
     if (handA) {
       const targetPos = handA.isOpenPalm ? handA.palm : handA.tip;
       const jumpDist = Math.hypot(
-        targetPos.x - this.rawPrevHandA.x,
-        targetPos.y - this.rawPrevHandA.y,
-        targetPos.z - this.rawPrevHandA.z
+        targetPos.x - this.prevHandPosA.x,
+        targetPos.y - this.prevHandPosA.y,
+        targetPos.z - this.prevHandPosA.z
       );
 
-      if (jumpDist > maxHandJump) {
+      if (jumpDist > maxHandJump && this.hasPrevHandA) {
         const ratio = maxHandJump / jumpDist;
-        targetPos.x = this.rawPrevHandA.x + (targetPos.x - this.rawPrevHandA.x) * ratio;
-        targetPos.y = this.rawPrevHandA.y + (targetPos.y - this.rawPrevHandA.y) * ratio;
-        targetPos.z = this.rawPrevHandA.z + (targetPos.z - this.rawPrevHandA.z) * ratio;
+        targetPos.x = this.prevHandPosA.x + (targetPos.x - this.prevHandPosA.x) * ratio;
+        targetPos.y = this.prevHandPosA.y + (targetPos.y - this.prevHandPosA.y) * ratio;
+        targetPos.z = this.prevHandPosA.z + (targetPos.z - this.prevHandPosA.z) * ratio;
       }
 
-      this.rawPrevHandA.x = targetPos.x;
-      this.rawPrevHandA.y = targetPos.y;
-      this.rawPrevHandA.z = targetPos.z;
+      if (this.hasPrevHandA) {
+        const rawVx = (targetPos.x - this.prevHandPosA.x) / safeDt;
+        const rawVy = (targetPos.y - this.prevHandPosA.y) / safeDt;
+        const rawVz = (targetPos.z - this.prevHandPosA.z) / safeDt;
+        const spd = Math.hypot(rawVx, rawVy, rawVz);
+        const maxSpd = this.config.maxHandSpeed;
+        const scale = spd > maxSpd ? maxSpd / spd : 1.0;
+        this.smoothedVelA.x += (rawVx * scale - this.smoothedVelA.x) * velSmoothFactor;
+        this.smoothedVelA.y += (rawVy * scale - this.smoothedVelA.y) * velSmoothFactor;
+        this.smoothedVelA.z += (rawVz * scale - this.smoothedVelA.z) * velSmoothFactor;
+      } else {
+        this.hasPrevHandA = true;
+      }
+
+      this.prevHandPosA.x = targetPos.x;
+      this.prevHandPosA.y = targetPos.y;
+      this.prevHandPosA.z = targetPos.z;
 
       this.smoothedAnchorA.x += (targetPos.x - this.smoothedAnchorA.x) * smoothFactor;
       this.smoothedAnchorA.y += (targetPos.y - this.smoothedAnchorA.y) * smoothFactor;
       this.smoothedAnchorA.z += (targetPos.z - this.smoothedAnchorA.z) * smoothFactor;
-
-      this.smoothedVelA.x += (handA.velocity.x - this.smoothedVelA.x) * velSmoothFactor;
-      this.smoothedVelA.y += (handA.velocity.y - this.smoothedVelA.y) * velSmoothFactor;
-      this.smoothedVelA.z += (handA.velocity.z - this.smoothedVelA.z) * velSmoothFactor;
 
       const targetPalm = handA.isOpenPalm ? 1.0 : 0.0;
       const targetPinch = handA.isPinching ? 1.0 : 0.0;
       this.gestureWeightA.openPalm += (targetPalm - this.gestureWeightA.openPalm) * gestureSpeed;
       this.gestureWeightA.pinch += (targetPinch - this.gestureWeightA.pinch) * gestureSpeed;
     } else {
-      this.gestureWeightA.openPalm = Math.max(0.0, this.gestureWeightA.openPalm - safeDt * 14.0);
-      this.gestureWeightA.pinch = Math.max(0.0, this.gestureWeightA.pinch - safeDt * 14.0);
+      this.hasPrevHandA = false;
+      this.gestureWeightA.openPalm = Math.max(0.0, this.gestureWeightA.openPalm - safeDt * 12.0);
+      this.gestureWeightA.pinch = Math.max(0.0, this.gestureWeightA.pinch - safeDt * 12.0);
       this.smoothedVelA.x *= 0.85;
       this.smoothedVelA.y *= 0.85;
       this.smoothedVelA.z *= 0.85;
@@ -375,49 +391,60 @@ export class ParticlePhysics {
     if (handB) {
       const targetPos = handB.isOpenPalm ? handB.palm : handB.tip;
       const jumpDist = Math.hypot(
-        targetPos.x - this.rawPrevHandB.x,
-        targetPos.y - this.rawPrevHandB.y,
-        targetPos.z - this.rawPrevHandB.z
+        targetPos.x - this.prevHandPosB.x,
+        targetPos.y - this.prevHandPosB.y,
+        targetPos.z - this.prevHandPosB.z
       );
 
-      if (jumpDist > maxHandJump) {
+      if (jumpDist > maxHandJump && this.hasPrevHandB) {
         const ratio = maxHandJump / jumpDist;
-        targetPos.x = this.rawPrevHandB.x + (targetPos.x - this.rawPrevHandB.x) * ratio;
-        targetPos.y = this.rawPrevHandB.y + (targetPos.y - this.rawPrevHandB.y) * ratio;
-        targetPos.z = this.rawPrevHandB.z + (targetPos.z - this.rawPrevHandB.z) * ratio;
+        targetPos.x = this.prevHandPosB.x + (targetPos.x - this.prevHandPosB.x) * ratio;
+        targetPos.y = this.prevHandPosB.y + (targetPos.y - this.prevHandPosB.y) * ratio;
+        targetPos.z = this.prevHandPosB.z + (targetPos.z - this.prevHandPosB.z) * ratio;
       }
 
-      this.rawPrevHandB.x = targetPos.x;
-      this.rawPrevHandB.y = targetPos.y;
-      this.rawPrevHandB.z = targetPos.z;
+      if (this.hasPrevHandB) {
+        const rawVx = (targetPos.x - this.prevHandPosB.x) / safeDt;
+        const rawVy = (targetPos.y - this.prevHandPosB.y) / safeDt;
+        const rawVz = (targetPos.z - this.prevHandPosB.z) / safeDt;
+        const spd = Math.hypot(rawVx, rawVy, rawVz);
+        const maxSpd = this.config.maxHandSpeed;
+        const scale = spd > maxSpd ? maxSpd / spd : 1.0;
+        this.smoothedVelB.x += (rawVx * scale - this.smoothedVelB.x) * velSmoothFactor;
+        this.smoothedVelB.y += (rawVy * scale - this.smoothedVelB.y) * velSmoothFactor;
+        this.smoothedVelB.z += (rawVz * scale - this.smoothedVelB.z) * velSmoothFactor;
+      } else {
+        this.hasPrevHandB = true;
+      }
+
+      this.prevHandPosB.x = targetPos.x;
+      this.prevHandPosB.y = targetPos.y;
+      this.prevHandPosB.z = targetPos.z;
 
       this.smoothedAnchorB.x += (targetPos.x - this.smoothedAnchorB.x) * smoothFactor;
       this.smoothedAnchorB.y += (targetPos.y - this.smoothedAnchorB.y) * smoothFactor;
       this.smoothedAnchorB.z += (targetPos.z - this.smoothedAnchorB.z) * smoothFactor;
-
-      this.smoothedVelB.x += (handB.velocity.x - this.smoothedVelB.x) * velSmoothFactor;
-      this.smoothedVelB.y += (handB.velocity.y - this.smoothedVelB.y) * velSmoothFactor;
-      this.smoothedVelB.z += (handB.velocity.z - this.smoothedVelB.z) * velSmoothFactor;
 
       const targetPalm = handB.isOpenPalm ? 1.0 : 0.0;
       const targetPinch = handB.isPinching ? 1.0 : 0.0;
       this.gestureWeightB.openPalm += (targetPalm - this.gestureWeightB.openPalm) * gestureSpeed;
       this.gestureWeightB.pinch += (targetPinch - this.gestureWeightB.pinch) * gestureSpeed;
     } else {
-      this.gestureWeightB.openPalm = Math.max(0.0, this.gestureWeightB.openPalm - safeDt * 14.0);
-      this.gestureWeightB.pinch = Math.max(0.0, this.gestureWeightB.pinch - safeDt * 14.0);
+      this.hasPrevHandB = false;
+      this.gestureWeightB.openPalm = Math.max(0.0, this.gestureWeightB.openPalm - safeDt * 12.0);
+      this.gestureWeightB.pinch = Math.max(0.0, this.gestureWeightB.pinch - safeDt * 12.0);
       this.smoothedVelB.x *= 0.85;
       this.smoothedVelB.y *= 0.85;
       this.smoothedVelB.z *= 0.85;
     }
 
-    // Unified Anchor & Two-Hand Merging Distance
+    // Unified Anchor & Two-Hand Proximity Merging (<15% viewport distance)
     let twoHandMergeFactor = 0.0;
-    if (worldHands.length === 1) {
-      this.smoothedUnifiedAnchor.x += (this.smoothedAnchorA.x - this.smoothedUnifiedAnchor.x) * smoothFactor;
-      this.smoothedUnifiedAnchor.y += (this.smoothedAnchorA.y - this.smoothedUnifiedAnchor.y) * smoothFactor;
-      this.smoothedUnifiedAnchor.z += (this.smoothedAnchorA.z - this.smoothedUnifiedAnchor.z) * smoothFactor;
-    } else if (worldHands.length >= 2) {
+    const viewMetric = Math.min(this.bounds.width, this.bounds.height);
+    const mergeThreshold = viewMetric * 0.28;
+    const mergeFullDist = viewMetric * 0.10;
+
+    if (this.isDualHandActive && handA && handB) {
       const midX = (this.smoothedAnchorA.x + this.smoothedAnchorB.x) * 0.5;
       const midY = (this.smoothedAnchorA.y + this.smoothedAnchorB.y) * 0.5;
       const midZ = (this.smoothedAnchorA.z + this.smoothedAnchorB.z) * 0.5;
@@ -430,22 +457,30 @@ export class ParticlePhysics {
         this.smoothedAnchorA.y - this.smoothedAnchorB.y,
         this.smoothedAnchorA.z - this.smoothedAnchorB.z
       );
-      twoHandMergeFactor = Math.max(0.0, Math.min(1.0, 1.0 - (handDist - 16.0) / 22.0));
+      if (handDist < mergeThreshold) {
+        twoHandMergeFactor = Math.max(
+          0.0,
+          Math.min(1.0, 1.0 - (handDist - mergeFullDist) / (mergeThreshold - mergeFullDist))
+        );
+      }
+    } else if (handA) {
+      this.smoothedUnifiedAnchor.x += (this.smoothedAnchorA.x - this.smoothedUnifiedAnchor.x) * smoothFactor;
+      this.smoothedUnifiedAnchor.y += (this.smoothedAnchorA.y - this.smoothedUnifiedAnchor.y) * smoothFactor;
+      this.smoothedUnifiedAnchor.z += (this.smoothedAnchorA.z - this.smoothedUnifiedAnchor.z) * smoothFactor;
     }
 
-    // 5. Update Pattern State Progress
+    // 4. Update Pattern State Progress (if an explicit pattern was requested)
     const patternAInfo = this.groupAState.update(safeDt);
     const patternBInfo = this.groupBState.update(safeDt);
     const unifiedPatternInfo = this.unifiedState.update(safeDt);
 
-    // 6. Interaction Mode Telemetry
+    // 5. Interaction Mode Telemetry
     if (this.isDualHandActive) {
       this.currentMode = 'DUAL_CONTROL';
-    } else if (worldHands.length > 0) {
-      const primary = worldHands[0];
-      if (primary.isPinching) {
+    } else if (handA) {
+      if (this.gestureWeightA.pinch > 0.4) {
         this.currentMode = 'ATTRACT';
-      } else if (primary.isOpenPalm) {
+      } else if (this.gestureWeightA.openPalm > 0.4) {
         this.currentMode = 'REPEL';
       } else {
         this.currentMode = 'FREE';
@@ -454,10 +489,10 @@ export class ParticlePhysics {
       this.currentMode = 'FREE';
     }
 
-    // 7. Simulation Constants & Viewport Extents
+    // 6. Simulation Constants & Viewport Extents
     const halfCount = Math.floor(totalCount / 2);
-    // Exponential momentum damping: velocity *= exp(-dampingCoeff * dt)
-    const dampingCoeff = (1.0 - this.config.damping) * 60.0 + 0.35;
+    // Momentum damping preserving fluid glide
+    const dampingCoeff = (1.0 - this.config.damping) * 60.0 + 0.28;
     const damping = Math.exp(-dampingCoeff * safeDt);
     const returnStr = this.config.returnStrength;
     const t = this.time;
@@ -466,85 +501,72 @@ export class ParticlePhysics {
     const pWeight = this.partitionWeight;
     const invPWeight = 1.0 - pWeight;
 
-    // Viewport Rectangular Extents (Soft elastic boundary)
+    // Viewport Soft Restoring Boundaries
     const limitX = this.bounds.halfWidth * 0.94;
     const limitY = this.bounds.halfHeight * 0.94;
-    const limitZ = 22.0;
+    const limitZ = 24.0;
 
     // -------------------------------------------------------------------------
-    // DYNAMIC MOVING VORTEX CENTERS (Instruction 5, 6, 7)
-    // Slowly drift through the scene to create living, continuously evolving formations:
-    // rosettes, circular rings, orbital bands, and curving ribbons!
+    // AUTONOMOUS FLUID VORTICES
+    // 1 dominant central vortex that precesses slowly + 2 gentle satellites.
+    // Clean Lamb-Oseen tangential profiles (NO radial sine blast waves).
     // -------------------------------------------------------------------------
     const vortices: DriftingVortex[] = [
-      // Vortex 0: Primary Core Vortex (Atomic Rosette + Concentric Breathing Rings)
+      // Primary Dominant Central Vortex (Atomic Core / Precessing Eye)
       {
-        x: Math.sin(t * 0.22) * 6.5,
-        y: Math.cos(t * 0.18) * 4.5,
-        z: Math.sin(t * 0.14) * 2.5,
-        strength: 34.0,
-        radius: 54.0,
-        axisX: Math.sin(t * 0.12) * 0.12,
-        axisY: Math.cos(t * 0.12) * 0.12,
+        x: Math.sin(t * 0.16) * 7.5,
+        y: Math.cos(t * 0.13) * 5.5,
+        z: Math.sin(t * 0.10) * 2.5,
+        strength: 28.0,
+        radius: 24.0,
+        axisX: Math.sin(t * 0.08) * 0.12,
+        axisY: Math.cos(t * 0.08) * 0.12,
         axisZ: 0.98,
-        radialFreq: 0.14,
-        radialAmp: 3.2,
-        rosetteLobes: 4, // 4-lobed atomic rosette petals (reference frames 00:04-00:06)
-        rosetteAmp: 0.28 * Math.sin(t * 0.35),
       },
-      // Vortex 1: Upper-Left Orbital Satellite (Clockwise Tilted Stream)
+      // Satellite 1: Upper-Left Gentle Orbital Stream (~18% strength)
       {
-        x: -limitX * 0.44 + Math.sin(t * 0.28) * 8.0,
-        y: limitY * 0.40 + Math.cos(t * 0.24) * 6.0,
-        z: Math.sin(t * 0.32) * 3.5,
-        strength: -24.0,
-        radius: 40.0,
-        axisX: 0.25,
-        axisY: 0.35,
-        axisZ: 0.90,
-        radialFreq: 0.18,
-        radialAmp: 2.2,
-        rosetteLobes: 3,
-        rosetteAmp: 0.15,
+        x: -limitX * 0.42 + Math.sin(t * 0.22) * 7.0,
+        y: limitY * 0.38 + Math.cos(t * 0.19) * 5.0,
+        z: Math.sin(t * 0.25) * 3.0,
+        strength: -5.5,
+        radius: 32.0,
+        axisX: 0.2,
+        axisY: 0.3,
+        axisZ: 0.93,
       },
-      // Vortex 2: Lower-Right Orbital Satellite (Counter-Clockwise Tilted Stream)
+      // Satellite 2: Lower-Right Gentle Orbital Stream (~18% strength)
       {
-        x: limitX * 0.44 + Math.cos(t * 0.26) * 8.0,
-        y: -limitY * 0.40 + Math.sin(t * 0.22) * 6.0,
-        z: -Math.sin(t * 0.32) * 3.5,
-        strength: 24.0,
-        radius: 40.0,
-        axisX: -0.25,
-        axisY: -0.35,
-        axisZ: 0.90,
-        radialFreq: 0.18,
-        radialAmp: 2.2,
-        rosetteLobes: 3,
-        rosetteAmp: 0.15,
-      },
-      // Vortex 3: Dynamic Connecting Ribbon Bridge
-      {
-        x: Math.sin(t * 0.34) * 14.0,
-        y: -limitY * 0.16 + Math.cos(t * 0.28) * 5.0,
-        z: Math.cos(t * 0.30) * 4.0,
-        strength: 18.0,
-        radius: 34.0,
-        axisX: 0.1,
-        axisY: 0.1,
-        axisZ: 0.98,
-        radialFreq: 0.12,
-        radialAmp: 1.5,
-        rosetteLobes: 2,
-        rosetteAmp: 0.1,
+        x: limitX * 0.42 + Math.cos(t * 0.20) * 7.0,
+        y: -limitY * 0.38 + Math.sin(t * 0.18) * 5.0,
+        z: -Math.sin(t * 0.25) * 3.0,
+        strength: 5.5,
+        radius: 32.0,
+        axisX: -0.2,
+        axisY: -0.3,
+        axisZ: 0.93,
       },
     ];
 
     const v0 = vortices[0];
-    const flowBaseSpeed = 19.0 * this.config.flowFieldStrength;
-    const responseFactor = 3.2; // Spring-like flow response factor (Instruction 14)
+    const flowBaseSpeed = 22.0 * this.config.flowFieldStrength;
+    const responseFactor = 2.8; // Inertia-preserving fluid adherence
+
+    // Natural fluid extent radius for gentle cohesion (zero inward force inside)
+    const fluidRestRadius = Math.min(limitX, limitY) * 0.68;
+
+    // Pre-calculate dual-hand mid properties for figure-8 binary star vortex
+    const midX = (this.smoothedAnchorA.x + this.smoothedAnchorB.x) * 0.5;
+    const midY = (this.smoothedAnchorA.y + this.smoothedAnchorB.y) * 0.5;
+    const midZ = (this.smoothedAnchorA.z + this.smoothedAnchorB.z) * 0.5;
+
+    // Check if patterns are requested
+    const hasPatternA = this.groupAState.pattern !== 'FREE' && this.groupAState.targetBuffer !== null;
+    const hasPatternB = this.groupBState.pattern !== 'FREE' && this.groupBState.targetBuffer !== null;
+    const hasPatternUnified =
+      this.unifiedState.pattern !== 'FREE' && this.unifiedState.targetBuffer !== null;
 
     // =========================================================================
-    // ZERO-ALLOCATION HIGH PERFORMANCE PARTICLE SIMULATION LOOP
+    // ZERO-ALLOCATION HIGH PERFORMANCE SIMULATION LOOP
     // =========================================================================
     for (let i = 0; i < totalCount; i++) {
       const i3 = i * 3;
@@ -560,7 +582,7 @@ export class ParticlePhysics {
       let vz = velocities[i3 + 2];
 
       // -----------------------------------------------------------------------
-      // 1. BASE FLOW (Divergence-Free Multi-Scale Curl Flow) (Instruction 2, 3, 4)
+      // 1. BASE DIVERGENCE-FREE FLOW FIELD
       // -----------------------------------------------------------------------
       const curl = this.getCurlFlow(px, py, pz, t);
       const baseFlowX = curl.x * flowBaseSpeed;
@@ -568,93 +590,84 @@ export class ParticlePhysics {
       const baseFlowZ = curl.z * flowBaseSpeed;
 
       // -----------------------------------------------------------------------
-      // 2. VORTEX & ORBITAL FLOW (Instruction 5, 6, 7)
-      // Tangential velocity + Harmonic Radial Velocity across Drifting Centers
+      // 2. VORTICES & ORBITAL FLOW (Lamb-Oseen Profile, Smooth Tangential Circulation)
       // -----------------------------------------------------------------------
       let vortexFlowX = 0;
       let vortexFlowY = 0;
       let vortexFlowZ = 0;
 
-      for (let vIdx = 0; vIdx < 4; vIdx++) {
+      for (let vIdx = 0; vIdx < 3; vIdx++) {
         const v = vortices[vIdx];
         const dx = px - v.x;
         const dy = py - v.y;
         const dz = pz - v.z;
-        const distSq = dx * dx + dy * dy + dz * dz + 4.0;
+        const distSq = dx * dx + dy * dy + dz * dz + 0.001;
         const dist = Math.sqrt(distSq);
 
-        if (dist < v.radius * 2.2) {
-          const invDist = 1.0 / dist;
-          const falloff = 1.0 / (1.0 + (dist / v.radius) * (dist / v.radius));
-
+        if (dist < v.radius * 2.5) {
           // Tangential direction: cross(axis, offset)
           let tx = v.axisY * dz - v.axisZ * dy;
           let ty = v.axisZ * dx - v.axisX * dz;
           let tz = v.axisX * dy - v.axisY * dx;
-          const tLen = Math.sqrt(tx * tx + ty * ty + tz * tz + 0.001);
+          const tLen = Math.sqrt(tx * tx + ty * ty + tz * tz + 0.0001);
           tx /= tLen;
           ty /= tLen;
           tz /= tLen;
 
-          // Rosette lobe angle modulation (Instruction 5, 7)
-          const angle = Math.atan2(dy, dx);
-          const rosetteMod = 1.0 + v.rosetteAmp * Math.cos(v.rosetteLobes * angle - t * 0.45);
-
-          // Tangential velocity component
-          const tanSpeed = v.strength * falloff * rosetteMod;
-          const vTanX = tx * tanSpeed;
-          const vTanY = ty * tanSpeed;
-          const vTanZ = tz * tanSpeed;
-
-          // Harmonic radial velocity (creates nested rings and breathing ribbons)
-          const radialSpeed = Math.sin(dist * v.radialFreq - t * 0.5) * v.radialAmp * falloff;
-          const vRadX = (dx * invDist) * radialSpeed;
-          const vRadY = (dy * invDist) * radialSpeed;
-          const vRadZ = (dz * invDist) * radialSpeed;
-
-          vortexFlowX += vTanX + vRadX;
-          vortexFlowY += vTanY + vRadY;
-          vortexFlowZ += vTanZ + vRadZ;
+          // Lamb-Oseen profile: v_tan = (Gamma * r) / (r0^2 + r^2)
+          const tanSpeed = (v.strength * dist) / (v.radius * v.radius + distSq);
+          vortexFlowX += tx * tanSpeed;
+          vortexFlowY += ty * tanSpeed;
+          vortexFlowZ += tz * tanSpeed;
         }
       }
 
       // -----------------------------------------------------------------------
-      // 3. CENTRAL COHESION FORCE (Instruction 8: FLOW + COHESION, NOT GRAVITY BALL)
+      // 3. GENTLE RESTORING COHESION (Zero inside fluid radius, soft restoring outside)
       // -----------------------------------------------------------------------
       const cdx = v0.x - px;
       const cdy = v0.y - py;
       const cdz = v0.z - pz;
       const cDist = Math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz + 0.001);
-      const cohesionMag = 2.2 * Math.tanh(cDist / 48.0);
-      const accCohesionX = (cdx / cDist) * cohesionMag;
-      const accCohesionY = (cdy / cDist) * cohesionMag;
-      const accCohesionZ = (cdz / cDist) * (cohesionMag * 0.7);
+      let accCohesionX = 0;
+      let accCohesionY = 0;
+      let accCohesionZ = 0;
+
+      if (cDist > fluidRestRadius) {
+        const excess = (cDist - fluidRestRadius) / 30.0;
+        const cohesionMag = 2.4 * Math.tanh(excess);
+        const invCDist = 1.0 / cDist;
+        accCohesionX = cdx * invCDist * cohesionMag;
+        accCohesionY = cdy * invCDist * cohesionMag;
+        accCohesionZ = cdz * invCDist * (cohesionMag * 0.6);
+      }
 
       // -----------------------------------------------------------------------
-      // 4. SPRING-LIKE FLOW ACCELERATION & INERTIA (Instruction 13, 14)
+      // 4. FLUID ADHERENCE & MOMENTUM INERTIA
       // targetVelocity = baseFlow + vortexFlow
-      // accelerationFlow = (targetVelocity - velocity) * responseFactor
+      // a_flow = (targetVelocity - velocity) * responseFactor
       // -----------------------------------------------------------------------
-      const targetFlowVx = baseFlowX * 0.40 + vortexFlowX * 0.85;
-      const targetFlowVy = baseFlowY * 0.40 + vortexFlowY * 0.85;
-      const targetFlowVz = baseFlowZ * 0.40 + vortexFlowZ * 0.85;
+      const targetFlowVx = baseFlowX * 0.45 + vortexFlowX * 0.85;
+      const targetFlowVy = baseFlowY * 0.45 + vortexFlowY * 0.85;
+      const targetFlowVz = baseFlowZ * 0.45 + vortexFlowZ * 0.85;
 
       const accFlowX = (targetFlowVx - vx) * responseFactor;
       const accFlowY = (targetFlowVy - vy) * responseFactor;
       const accFlowZ = (targetFlowVz - vz) * responseFactor;
 
       // -----------------------------------------------------------------------
-      // 5. PROCEDURAL TARGET SPRING FORCES (if pattern mode active)
+      // 5. PROCEDURAL PATTERN SPRINGS (ONLY active when explicit shape requested)
+      // In 'FREE' flow, accPattern is strictly 0.
       // -----------------------------------------------------------------------
       let accPatternX = 0;
       let accPatternY = 0;
       let accPatternZ = 0;
-      const springK = this.config.patternSpringForce;
 
-      if (pWeight > 0.01) {
+      if (pWeight > 0.01 && (hasPatternA || hasPatternB)) {
         const targetBuffer = isGroupA ? this.groupAState.targetBuffer : this.groupBState.targetBuffer;
         const patternInfo = isGroupA ? patternAInfo : patternBInfo;
         const anchor = isGroupA ? this.smoothedAnchorA : this.smoothedAnchorB;
+        const springK = this.config.patternSpringForce;
 
         if (targetBuffer && targetBuffer.length > groupLocalIdx * 3 + 2) {
           const txRaw = targetBuffer[groupLocalIdx * 3];
@@ -672,7 +685,7 @@ export class ParticlePhysics {
           let targetY = dualTargetY;
           let targetZ = dualTargetZ;
 
-          if (pWeight < 0.99 && this.unifiedState.targetBuffer) {
+          if (pWeight < 0.99 && hasPatternUnified && this.unifiedState.targetBuffer) {
             const uRawX = this.unifiedState.targetBuffer[i3];
             const uRawY = this.unifiedState.targetBuffer[i3 + 1];
             const uRawZ = this.unifiedState.targetBuffer[i3 + 2];
@@ -687,11 +700,11 @@ export class ParticlePhysics {
             targetZ = dualTargetZ * pWeight + uTargetZ * invPWeight;
           }
 
-          accPatternX = (targetX - px) * springK * 2.2;
-          accPatternY = (targetY - py) * springK * 2.2;
-          accPatternZ = (targetZ - pz) * springK * 2.2;
+          accPatternX = (targetX - px) * springK;
+          accPatternY = (targetY - py) * springK;
+          accPatternZ = (targetZ - pz) * springK;
         }
-      } else if (this.unifiedState.targetBuffer && this.unifiedState.targetBuffer.length > i3 + 2) {
+      } else if (hasPatternUnified && this.unifiedState.targetBuffer) {
         const uRawX = this.unifiedState.targetBuffer[i3];
         const uRawY = this.unifiedState.targetBuffer[i3 + 1];
         const uRawZ = this.unifiedState.targetBuffer[i3 + 2];
@@ -702,44 +715,21 @@ export class ParticlePhysics {
         const targetY = this.smoothedUnifiedAnchor.y + uRotY;
         const targetZ = this.smoothedUnifiedAnchor.z + uRawZ;
 
-        accPatternX = (targetX - px) * springK * 2.2;
-        accPatternY = (targetY - py) * springK * 2.2;
-        accPatternZ = (targetZ - pz) * springK * 2.2;
+        const springK = this.config.patternSpringForce;
+        accPatternX = (targetX - px) * springK;
+        accPatternY = (targetY - py) * springK;
+        accPatternZ = (targetZ - pz) * springK;
       }
 
       // -----------------------------------------------------------------------
-      // 6. FAST FLUID HAND INTERACTION (Instruction 16, 17, 18, 19, 20, 21, 22, 23)
-      // Directional Wake + Swirling Vortex + Open Palm Repulsion + Pinch Gravity
+      // 6. HAND FORCES & VELOCITY WAKE
       // -----------------------------------------------------------------------
-      const activeHand = isGroupA ? handA : (handB || (pWeight < 0.2 ? handA : null));
+      // Group A follows Left hand; Group B follows Right hand.
+      // When single hand is active, both groups interact with it.
+      const activeHand = isGroupA ? handA : (handB || (pWeight < 0.1 ? handA : null));
       let activeAnchor = isGroupA ? this.smoothedAnchorA : (handB ? this.smoothedAnchorB : this.smoothedAnchorA);
       let activeVel = isGroupA ? this.smoothedVelA : (handB ? this.smoothedVelB : this.smoothedVelA);
       let activeGestures = isGroupA ? this.gestureWeightA : (handB ? this.gestureWeightB : this.gestureWeightA);
-
-      // Two-Hand Merging: When hands come close together, smoothly interpolate anchors & forces
-      if (twoHandMergeFactor > 0.01 && handA && handB) {
-        const midAnchorX = (this.smoothedAnchorA.x + this.smoothedAnchorB.x) * 0.5;
-        const midAnchorY = (this.smoothedAnchorA.y + this.smoothedAnchorB.y) * 0.5;
-        const midAnchorZ = (this.smoothedAnchorA.z + this.smoothedAnchorB.z) * 0.5;
-        const midVelX = (this.smoothedVelA.x + this.smoothedVelB.x) * 0.5;
-        const midVelY = (this.smoothedVelA.y + this.smoothedVelB.y) * 0.5;
-        const midVelZ = (this.smoothedVelA.z + this.smoothedVelB.z) * 0.5;
-
-        activeAnchor = {
-          x: activeAnchor.x * (1.0 - twoHandMergeFactor) + midAnchorX * twoHandMergeFactor,
-          y: activeAnchor.y * (1.0 - twoHandMergeFactor) + midAnchorY * twoHandMergeFactor,
-          z: activeAnchor.z * (1.0 - twoHandMergeFactor) + midAnchorZ * twoHandMergeFactor,
-        };
-        activeVel = {
-          x: activeVel.x * (1.0 - twoHandMergeFactor) + midVelX * twoHandMergeFactor,
-          y: activeVel.y * (1.0 - twoHandMergeFactor) + midVelY * twoHandMergeFactor,
-          z: activeVel.z * (1.0 - twoHandMergeFactor) + midVelZ * twoHandMergeFactor,
-        };
-        activeGestures = {
-          openPalm: Math.max(this.gestureWeightA.openPalm, this.gestureWeightB.openPalm),
-          pinch: Math.max(this.gestureWeightA.pinch, this.gestureWeightB.pinch),
-        };
-      }
 
       let accWakeX = 0;
       let accWakeY = 0;
@@ -768,64 +758,99 @@ export class ParticlePhysics {
         const swirlX = -dirY;
         const swirlY = dirX;
 
-        // 6A. Directional Fluid Velocity Wake (Instruction 18)
+        // 6A. Physical Hand Velocity Wake: pushes fluid directly along hand motion
         const wakeRadius = this.config.fingertipInfluenceRadius * 1.5;
         if (dist < wakeRadius) {
           const wakeFactor = Math.pow(1.0 - dist / wakeRadius, 1.4);
           const wakeStrength = this.config.fluidWakeForce;
 
-          accWakeX += activeVel.x * wakeFactor * wakeStrength * 1.35;
-          accWakeY += activeVel.y * wakeFactor * wakeStrength * 1.35;
-          accWakeZ += activeVel.z * wakeFactor * wakeStrength * 1.35;
+          accWakeX += activeVel.x * wakeFactor * wakeStrength * 0.9;
+          accWakeY += activeVel.y * wakeFactor * wakeStrength * 0.9;
+          accWakeZ += activeVel.z * wakeFactor * wakeStrength * 0.9;
 
-          // Tangential curl around moving hand creates swirling trailing vortices
+          // Trailing curling vortices behind moving hand
           const handSpeed = Math.hypot(activeVel.x, activeVel.y);
-          if (handSpeed > 1.0) {
-            const curlAmt = Math.min(1.0, handSpeed / 28.0) * this.config.vortexForce * 0.75;
-            accWakeX += swirlX * wakeFactor * curlAmt * 1.2;
-            accWakeY += swirlY * wakeFactor * curlAmt * 1.2;
+          if (handSpeed > 1.5) {
+            const curlAmt = Math.min(1.0, handSpeed / 25.0) * this.config.vortexForce * 0.6;
+            accWakeX += swirlX * wakeFactor * curlAmt;
+            accWakeY += swirlY * wakeFactor * curlAmt;
           }
         }
 
-        // 6B. OPEN_PALM: Strong Local Fluid Dispersion Wave (Instruction 19)
+        // 6B. OPEN PALM: Fluid Obstacle (Radial Repulsion + Tangential Parting Stream)
         if (activeGestures.openPalm > 0.01) {
           const repelRadius = this.config.handRepelRadius;
           if (dist < repelRadius) {
-            const factor = Math.pow(1.0 - dist / repelRadius, 1.35);
+            const factor = Math.pow(1.0 - dist / repelRadius, 1.5);
             const repelF = factor * this.config.handRepelForce * activeGestures.openPalm;
 
-            accHandForceX += dirX * repelF * 1.8;
-            accHandForceY += dirY * repelF * 1.8;
-            accHandForceZ += dirZ * repelF * 0.9;
+            // Radial repulsion preventing fluid penetration
+            accHandForceX += dirX * repelF * 1.4;
+            accHandForceY += dirY * repelF * 1.4;
+            accHandForceZ += dirZ * repelF * 0.7;
 
-            // Fluid curl around perimeter of palm
-            accHandForceX += swirlX * repelF * 0.45;
-            accHandForceY += swirlY * repelF * 0.45;
+            // Tangential deflection: particles deflect around the palm like water around a smooth stone
+            // Relative velocity across hand normal
+            const relVx = vx - activeVel.x;
+            const relVy = vy - activeVel.y;
+            const crossZ = dirX * relVy - dirY * relVx;
+            const deflectSign = crossZ >= 0 ? 1.0 : -1.0;
+
+            const deflectSpeed = repelF * 0.65;
+            accHandForceX += swirlX * deflectSign * deflectSpeed;
+            accHandForceY += swirlY * deflectSign * deflectSpeed;
           }
         }
 
-        // 6C. PINCH: Local Attractor + Vortex (Instruction 20: Magnetic Attraction + Swirling Vortex)
+        // 6C. PINCH: Magnetic Attractor with Orbital Accretion Disk (NO Point Collapse)
         if (activeGestures.pinch > 0.01) {
           const attractRadius = this.config.handAttractRadius;
           if (dist < attractRadius) {
-            const factor = Math.pow(1.0 - dist / attractRadius, 1.3);
-            const attractF = factor * this.config.handAttractForce * activeGestures.pinch;
-            const vortexStrength = factor * this.config.vortexForce * 2.2 * activeGestures.pinch;
+            const factor = Math.pow(1.0 - dist / attractRadius, 1.25);
+            const orbitRadius = 6.5; // Soft equilibrium orbital distance
+            const coreRadius = 3.5;
 
-            // Inward magnetic pull toward pinch point
-            accHandForceX -= dirX * attractF * 1.9;
-            accHandForceY -= dirY * attractF * 1.9;
-            accHandForceZ -= dirZ * attractF * 0.95;
+            // Inward magnetic pull towards orbitRadius; if r < orbitRadius, gently cushions outward
+            const radialDelta = dist - orbitRadius;
+            const radialNorm = radialDelta / Math.max(dist, coreRadius);
+            const attractF = radialNorm * factor * this.config.handAttractForce * 1.6 * activeGestures.pinch;
 
-            // Fast swirling orbital vortex around pinch point
-            accHandForceX += swirlX * vortexStrength * 1.8;
-            accHandForceY += swirlY * vortexStrength * 1.8;
+            accHandForceX -= dirX * attractF;
+            accHandForceY -= dirY * attractF;
+            accHandForceZ -= dirZ * attractF * 0.6;
+
+            // Angular orbital swirl: speeds up closer to core (conservation of angular momentum)
+            const swirlBoost = (attractRadius / (dist + coreRadius)) * factor;
+            const swirlF = swirlBoost * this.config.vortexForce * 1.6 * activeGestures.pinch;
+
+            accHandForceX += swirlX * swirlF;
+            accHandForceY += swirlY * swirlF;
           }
         }
       }
 
+      // 6D. TWO-HAND MERGING: Binary Star / Figure-8 Vortex when hands approach
+      if (twoHandMergeFactor > 0.01 && handA && handB) {
+        const mdx = px - midX;
+        const mdy = py - midY;
+        const mdz = pz - midZ;
+        const mDistSq = mdx * mdx + mdy * mdy + mdz * mdz + 0.001;
+        const mDist = Math.sqrt(mDistSq);
+
+        if (mDist < mergeThreshold * 1.6) {
+          const mInv = 1.0 / mDist;
+          const mSwirlX = -mdy * mInv;
+          const mSwirlY = mdx * mInv;
+          const binaryStrength = 18.0 * twoHandMergeFactor;
+          const falloff = 1.0 / (1.0 + (mDist / 28.0) * (mDist / 28.0));
+
+          accHandForceX += mSwirlX * binaryStrength * falloff;
+          accHandForceY += mSwirlY * binaryStrength * falloff;
+        }
+      }
+
       // -----------------------------------------------------------------------
-      // 7. SOFT BOUNDARY RESTORING FORCE (Instruction 24: No hard bounce, soft curve)
+      // 7. SOFT FRUSTUM BOUNDARIES (Curving Deflection Along Edges, No Hard Bounce)
       // -----------------------------------------------------------------------
       let accBoundX = 0;
       let accBoundY = 0;
@@ -834,18 +859,18 @@ export class ParticlePhysics {
       const boundMarginX = limitX * 0.88;
       if (Math.abs(px) > boundMarginX) {
         const pen = (Math.abs(px) - boundMarginX) / (limitX - boundMarginX);
-        const force = Math.pow(Math.min(2.0, pen), 1.8) * returnStr * 60.0;
+        const force = Math.pow(Math.min(2.0, pen), 1.8) * returnStr * 65.0;
         accBoundX -= Math.sign(px) * force;
         // Tangent deflection curving gracefully along boundary
-        accBoundY += Math.sign(px) * (py > 0 ? -1 : 1) * force * 0.28;
+        accBoundY += Math.sign(px) * (py > 0 ? -1 : 1) * force * 0.35;
       }
 
       const boundMarginY = limitY * 0.88;
       if (Math.abs(py) > boundMarginY) {
         const pen = (Math.abs(py) - boundMarginY) / (limitY - boundMarginY);
-        const force = Math.pow(Math.min(2.0, pen), 1.8) * returnStr * 60.0;
+        const force = Math.pow(Math.min(2.0, pen), 1.8) * returnStr * 65.0;
         accBoundY -= Math.sign(py) * force;
-        accBoundX += Math.sign(py) * (px > 0 ? -1 : 1) * force * 0.28;
+        accBoundX += Math.sign(py) * (px > 0 ? -1 : 1) * force * 0.35;
       }
 
       if (Math.abs(pz) > limitZ) {
@@ -854,8 +879,8 @@ export class ParticlePhysics {
       }
 
       // -----------------------------------------------------------------------
-      // 8. FINAL ACCELERATION INTEGRATION & MOMENTUM (Instruction 1, 13)
-      // acceleration = baseFlow + vortexFlow + orbitalFlow + cohesion + handForce + handWake + boundaryForce
+      // 8. FINAL ACCELERATION INTEGRATION & MOMENTUM
+      // acceleration = a_baseFlow + a_vortexFlow + a_cohesion + a_handForce + a_handWake + a_boundaryForce
       // -----------------------------------------------------------------------
       const accTotalX = accFlowX + accCohesionX + accWakeX + accHandForceX + accBoundX + accPatternX;
       const accTotalY = accFlowY + accCohesionY + accWakeY + accHandForceY + accBoundY + accPatternY;
@@ -880,7 +905,7 @@ export class ParticlePhysics {
       }
 
       // -----------------------------------------------------------------------
-      // 9. CONTINUOUS POSITION INTEGRATION (No direct teleportation, no per-frame jitter)
+      // 9. CONTINUOUS POSITION INTEGRATION (No teleportation, smooth stream trails)
       // -----------------------------------------------------------------------
       px += vx * safeDt;
       py += vy * safeDt;
@@ -895,23 +920,23 @@ export class ParticlePhysics {
       velocities[i3 + 2] = vz;
 
       // -----------------------------------------------------------------------
-      // 10. COLOR, RADIANCE & LUMINOUS ENERGY MODULATION (Instruction 26, 27)
-      // White core + cyan/teal + subtle purple + subtle green, additive radiance
+      // 10. COLOR, RADIANCE & LUMINOUS ENERGY MODULATION
+      // Luminous cyan/teal + violet/purple base with pure white core heat on speed/interaction
       // -----------------------------------------------------------------------
       const currentSpeed = Math.sqrt(speedSq);
-      const speedNorm = Math.min(1.0, currentSpeed / 20.0);
-      const proximityNorm = Math.max(0.0, 1.0 - minHandDist / 36.0);
+      const speedNorm = Math.min(1.0, currentSpeed / 22.0);
+      const proximityNorm = Math.max(0.0, 1.0 - minHandDist / 34.0);
 
-      const groupHueOffset = isGroupA ? 0.0 : (pWeight * 0.28);
-      const blendA = ((Math.sin(i * 0.04 + t * 0.45 + groupHueOffset) + 1.0) * 0.5);
+      const groupHueOffset = isGroupA ? 0.0 : pWeight * 0.25;
+      const blendA = (Math.sin(i * 0.035 + t * 0.4 + groupHueOffset) + 1.0) * 0.5;
 
       let r = primary[0] * blendA + secondary[0] * (1.0 - blendA);
       let g = primary[1] * blendA + secondary[1] * (1.0 - blendA);
       let b = primary[2] * blendA + secondary[2] * (1.0 - blendA);
 
-      // Fast streaming particles and particles near hands ignite with pure white star-core heat
-      if (speedNorm > 0.05 || proximityNorm > 0.05) {
-        const energeticWeight = Math.max(speedNorm, proximityNorm);
+      // Fast streaming particles and particles interacting with hands ignite with white star-core heat
+      const energeticWeight = Math.max(speedNorm * 0.85, proximityNorm * 0.95);
+      if (energeticWeight > 0.05) {
         r = r * (1.0 - energeticWeight) + highlight[0] * energeticWeight;
         g = g * (1.0 - energeticWeight) + highlight[1] * energeticWeight;
         b = b * (1.0 - energeticWeight) + highlight[2] * energeticWeight;
@@ -921,8 +946,8 @@ export class ParticlePhysics {
       colors[i3 + 1] = g;
       colors[i3 + 2] = b;
 
-      const baseAlpha = 0.58 + 0.35 * Math.sin(i * 0.08 + t);
-      alphas[i] = Math.min(1.0, baseAlpha + speedNorm * 0.45 + proximityNorm * 0.45);
+      const baseAlpha = 0.62 + 0.32 * Math.sin(i * 0.07 + t * 0.8);
+      alphas[i] = Math.min(1.0, baseAlpha + speedNorm * 0.4 + proximityNorm * 0.4);
     }
 
     return this.currentMode;
